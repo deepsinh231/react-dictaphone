@@ -17,17 +17,23 @@ import {
   MenuItem,
   // keyframes,
   useToast,
+  Spinner,
+  Tag,
 } from "@chakra-ui/react";
-import { FaMicrophone, FaStop, FaDownload, FaRedo } from "react-icons/fa";
+import { FaMicrophone, FaStop, FaDownload, FaRedo, FaLanguage, FaPlay } from "react-icons/fa";
 import SpeechRecognition, { useSpeechRecognition } from "react-speech-recognition";
 
 // Keyframes for the pulsing microphone animation
-// const pulse = "keyframes`
+// const pulse = keyframes`
 //   0% { transform: scale(1); }
 //   50% { transform: scale(1.05); }
 //   100% { transform: scale(1); }
-// `;"
-const pulse = "transform: scale(1);"
+// `;
+
+const pulse = "keyframes"
+// Define chunk duration in seconds
+const CHUNK_DURATION = 10; // 10 seconds per chunk
+
 const DictaphoneUI = () => {
   const {
     transcript, // This is the combined transcript (interim + final)
@@ -38,44 +44,23 @@ const DictaphoneUI = () => {
     browserSupportsSpeechRecognition,
   } = useSpeechRecognition();
 
-  const [recordingAudio, setRecordingAudio] = useState(false); // Separated from speech recognition 'listening'
-  const [recordings, setRecordings] = useState([]);
-  const [language, setLanguage] = useState("en-US"); // Default to English for broader use
-  const [seconds, setSeconds] = useState(0);
-  const [transcribedSegments, setTranscribedSegments] = useState([]); // Stores final segments with timestamps
-  const [currentInterim, setCurrentInterim] = useState(""); // To display current interim text
+  const [recordingAudio, setRecordingAudio] = useState(false);
+  const [recordings, setRecordings] = useState([]); // Stores full audio recordings
+  const [sourceLanguage, setSourceLanguage] = useState("en-US"); // Source for speech recognition
+  const [targetLanguage, setTargetLanguage] = useState("es"); // Target for translation
+  const [seconds, setSeconds] = useState(0); // Total recording time
+  const [chunks, setChunks] = useState([]); // Stores { startTime, endTime, originalText, translatedText, id }
+  const [currentInterimForChunk, setCurrentInterimForChunk] = useState(""); // Interim text for the *current* chunk
+  const [isTranslating, setIsTranslating] = useState(false);
 
   const mediaRecorderRef = useRef(null);
-  const audioChunksRef = useRef([]);
-  const timerRef = useRef(null);
-  const lastFinalTranscriptRef = useRef(""); // To track only newly finalized parts
-  const toast = useToast(); // For user feedback
+  const audioChunksRef = useRef([]); // For the single full audio recording
+  const timerRef = useRef(null); // For overall recording timer
+  const chunkTimerRef = useRef(null); // For chunking logic
+  const lastFinalTranscriptRef = useRef(""); // To track only newly finalized parts from speech recognition
+  const toast = useToast();
 
-  // Effect to update currentInterim when interimTranscript changes
-  useEffect(() => {
-    if (listening) {
-      setCurrentInterim(interimTranscript);
-    } else {
-      setCurrentInterim("");
-    }
-  }, [interimTranscript, listening]);
-
-  // Effect to process final transcripts into segments
-  useEffect(() => {
-    if (finalTranscript && finalTranscript !== lastFinalTranscriptRef.current) {
-      const newFinalPart = finalTranscript.substring(lastFinalTranscriptRef.current.length).trim();
-      if (newFinalPart) {
-        setTranscribedSegments((prev) => [
-          ...prev,
-          { text: newFinalPart, timestamp: seconds },
-        ]);
-      }
-      lastFinalTranscriptRef.current = finalTranscript;
-      setCurrentInterim(""); // Clear interim once a final part is added
-    }
-  }, [finalTranscript, seconds]);
-
-  // Timer effect
+  // Effect to manage the overall recording timer
   useEffect(() => {
     if (!recordingAudio) {
       clearInterval(timerRef.current);
@@ -85,7 +70,63 @@ const DictaphoneUI = () => {
     return () => clearInterval(timerRef.current);
   }, [recordingAudio]);
 
-  // Formats time for display, SRT, and VTT
+  // Effect to manage chunking logic based on time
+  useEffect(() => {
+    if (recordingAudio && listening) {
+      // Clear previous chunk timer if restarting
+      clearInterval(chunkTimerRef.current);
+
+      const startChunkTime = Math.floor(seconds / CHUNK_DURATION) * CHUNK_DURATION;
+
+      // This interval will fire every CHUNK_DURATION seconds
+      chunkTimerRef.current = setInterval(() => {
+        const currentChunkEndTime = startChunkTime + CHUNK_DURATION;
+        finalizeCurrentChunk(currentChunkEndTime);
+      }, CHUNK_DURATION * 1000 - (seconds % CHUNK_DURATION) * 1000); // Adjust initial delay
+
+    } else {
+      clearInterval(chunkTimerRef.current);
+    }
+    return () => clearInterval(chunkTimerRef.current);
+  }, [recordingAudio, listening, seconds]); // Re-run if recording/listening state changes or seconds update for timer adjustment
+
+  // Effect to process final transcripts from speech recognition
+  useEffect(() => {
+    if (finalTranscript && finalTranscript !== lastFinalTranscriptRef.current) {
+      const newFinalPart = finalTranscript.substring(lastFinalTranscriptRef.current.length).trim();
+      if (newFinalPart) {
+        setCurrentInterimForChunk((prev) => prev + " " + newFinalPart);
+      }
+      lastFinalTranscriptRef.current = finalTranscript;
+    }
+  }, [finalTranscript]);
+
+  // Function to finalize the current chunk
+  const finalizeCurrentChunk = useCallback((endTime) => {
+    setChunks((prevChunks) => {
+      const lastChunk = prevChunks[prevChunks.length - 1];
+      const newChunkStartTime = lastChunk ? lastChunk.endTime : 0;
+      const newChunkEndTime = endTime; // or min(endTime, seconds) to not go beyond current recording
+
+      // If currentInterimForChunk is not empty, create a new chunk
+      if (currentInterimForChunk.trim()) {
+        const newChunk = {
+          id: Date.now() + Math.random(), // Unique ID
+          startTime: newChunkStartTime,
+          endTime: newChunkEndTime,
+          originalText: currentInterimForChunk.trim(),
+          translatedText: "", // Will be filled later
+        };
+        // Reset current interim for the next chunk
+        setCurrentInterimForChunk("");
+        return [...prevChunks, newChunk];
+      }
+      return prevChunks; // No text to finalize, return existing chunks
+    });
+  }, [currentInterimForChunk]);
+
+
+  // Helper to format time (HH:MM:SS.mmm for VTT, HH:MM:SS,mmm for SRT, MM:SS for display)
   const formatTime = useCallback((secs, formatType = "display") => {
     const totalMs = Math.floor(secs * 1000);
     const h = Math.floor(totalMs / 3600000);
@@ -104,6 +145,82 @@ const DictaphoneUI = () => {
     // Default for display (MM:SS)
     return `${pad(m)}:${pad(s)}`;
   }, []);
+
+  // Simulate a translation API call
+  const translateText = async (text, sourceLang, targetLang) => {
+    setIsTranslating(true);
+    // In a real app, this would be an API call to a backend that uses Google Cloud Translation, DeepL, etc.
+    // Example: const response = await axios.post('/api/translate', { text, sourceLang, targetLang });
+    // return response.data.translatedText;
+
+    // --- MOCK TRANSLATION (Replace with real API call) ---
+    await new Promise((resolve) => setTimeout(resolve, 500 + Math.random() * 1000)); // Simulate network delay
+    const mockTranslations = {
+      "en-US": {
+        "es": "Esto es texto de ejemplo.",
+        "fr": "Ceci est un exemple de texte.",
+        "hi": "यह उदाहरण पाठ है।",
+        "gu": "આ ઉદાહરણ ટેક્સ્ટ છે."
+      },
+      "gu-IN": {
+        "en": "This is example text.",
+        "es": "Esto es texto de ejemplo.",
+        "hi": "यह उदाहरण पाठ है।"
+      },
+      "hi-IN": {
+        "en": "This is example text.",
+        "es": "Esto es texto de ejemplo.",
+        "gu": "આ ઉદાહરણ ટેક્સ્ટ છે."
+      },
+      // Add more mock translations as needed
+    };
+    const translated = mockTranslations[sourceLang]?.[targetLang] || `[Translated to ${targetLang}: ${text}]`;
+    setIsTranslating(false);
+    return translated;
+  };
+
+  const handleTranslateAll = async () => {
+    if (chunks.length === 0) {
+      toast({
+        title: "No text to translate.",
+        status: "info",
+        duration: 2000,
+        isClosable: true,
+      });
+      return;
+    }
+
+    setIsTranslating(true);
+    toast({
+      title: "Translating chunks...",
+      status: "info",
+      duration: 3000,
+      isClosable: true,
+      position: "top",
+    });
+
+    const translatedChunks = await Promise.all(
+      chunks.map(async (chunk) => {
+        if (!chunk.originalText || chunk.originalText.trim() === "") {
+          return { ...chunk, translatedText: "" };
+        }
+        const translatedText = await translateText(
+          chunk.originalText,
+          sourceLanguage.split('-')[0], // Use base language code for mock
+          targetLanguage
+        );
+        return { ...chunk, translatedText };
+      })
+    );
+    setChunks(translatedChunks);
+    setIsTranslating(false);
+    toast({
+      title: "Translation complete!",
+      status: "success",
+      duration: 2000,
+      isClosable: true,
+    });
+  };
 
   if (!browserSupportsSpeechRecognition) {
     return (
@@ -131,15 +248,15 @@ const DictaphoneUI = () => {
   const startRecording = async () => {
     // Reset all previous states
     resetTranscript();
-    setTranscribedSegments([]);
+    setChunks([]);
     lastFinalTranscriptRef.current = "";
     setSeconds(0);
-    setCurrentInterim("");
+    setCurrentInterimForChunk("");
 
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       mediaRecorderRef.current = new MediaRecorder(stream);
-      audioChunksRef.current = [];
+      audioChunksRef.current = []; // Reset for new full audio recording
 
       mediaRecorderRef.current.ondataavailable = (event) => {
         audioChunksRef.current.push(event.data);
@@ -149,17 +266,17 @@ const DictaphoneUI = () => {
         const audioBlob = new Blob(audioChunksRef.current, { type: "audio/wav" });
         const url = URL.createObjectURL(audioBlob);
         setRecordings((prev) => [...prev, { url, duration: seconds, timestamp: Date.now() }]);
-        // Stop all tracks on the stream after recording to release microphone
-        stream.getTracks().forEach(track => track.stop());
+        stream.getTracks().forEach(track => track.stop()); // Release microphone
       };
 
       mediaRecorderRef.current.start();
-      SpeechRecognition.startListening({ continuous: true, language });
+      SpeechRecognition.startListening({ continuous: true, interimResults: true, language: sourceLanguage });
       setRecordingAudio(true);
       toast({
         title: "Recording started!",
+        description: `Transcribing in ${sourceLanguage} and chunking every ${CHUNK_DURATION} seconds.`,
         status: "success",
-        duration: 2000,
+        duration: 3000,
         isClosable: true,
       });
     } catch (err) {
@@ -171,8 +288,8 @@ const DictaphoneUI = () => {
         duration: 5000,
         isClosable: true,
       });
-      setRecordingAudio(false); // Ensure button state is consistent
-      SpeechRecognition.stopListening(); // Stop listening if mic access failed
+      setRecordingAudio(false);
+      SpeechRecognition.stopListening();
     }
   };
 
@@ -183,15 +300,11 @@ const DictaphoneUI = () => {
     SpeechRecognition.stopListening();
     setRecordingAudio(false);
     clearInterval(timerRef.current);
+    clearInterval(chunkTimerRef.current);
 
-    // If there's any remaining interim transcript when stopping, add it as a segment
-    if (currentInterim.trim() && !finalTranscript.includes(currentInterim.trim())) {
-      setTranscribedSegments((prev) => [
-        ...prev,
-        { text: currentInterim.trim(), timestamp: seconds },
-      ]);
-    }
-    setCurrentInterim(""); // Clear any remaining interim
+    // Finalize any remaining interim text into a chunk
+    finalizeCurrentChunk(seconds); // Use current total seconds as end time
+    setCurrentInterimForChunk("");
     lastFinalTranscriptRef.current = transcript; // Ensure full transcript is considered 'finalized'
     toast({
       title: "Recording stopped.",
@@ -216,38 +329,42 @@ const DictaphoneUI = () => {
     });
   };
 
-  const downloadTXT = () => {
-    const content = transcribedSegments.map((item) => `[${formatTime(item.timestamp)}] ${item.text}`).join("\n");
-    downloadFile(content, "transcript.txt", "text/plain");
-  };
-
-  const downloadSRT = () => {
-    const content = transcribedSegments.map((item, i) => {
-      const startTime = item.timestamp;
-      const endTime = i + 1 < transcribedSegments.length ? transcribedSegments[i + 1].timestamp : seconds;
-      return `${i + 1}\n${formatTime(startTime, "srt")} --> ${formatTime(endTime, "srt")}\n${item.text}\n`;
+  const downloadTXT = (translated = false) => {
+    const content = chunks.map((item) => {
+      const text = translated && item.translatedText ? item.translatedText : item.originalText;
+      return `[${formatTime(item.startTime)} - ${formatTime(item.endTime)}] ${text}`;
     }).join("\n");
-    downloadFile(content, "transcript.srt", "text/plain");
+    const filename = translated ? "translated_transcript.txt" : "original_transcript.txt";
+    downloadFile(content, filename, "text/plain");
   };
 
-  const downloadVTT = () => {
+  const downloadSRT = (translated = false) => {
+    const content = chunks.map((item, i) => {
+      const text = translated && item.translatedText ? item.translatedText : item.originalText;
+      return `${i + 1}\n${formatTime(item.startTime, "srt")} --> ${formatTime(item.endTime, "srt")}\n${text}\n`;
+    }).join("\n");
+    const filename = translated ? "translated_transcript.srt" : "original_transcript.srt";
+    downloadFile(content, filename, "text/plain");
+  };
+
+  const downloadVTT = (translated = false) => {
     let content = "WEBVTT\n\n";
-    content += transcribedSegments.map((item, i) => {
-      const startTime = item.timestamp;
-      const endTime = i + 1 < transcribedSegments.length ? transcribedSegments[i + 1].timestamp : seconds;
-      return `${formatTime(startTime, "vtt")} --> ${formatTime(endTime, "vtt")}\n${item.text}`;
+    content += chunks.map((item) => {
+      const text = translated && item.translatedText ? item.translatedText : item.originalText;
+      return `${formatTime(item.startTime, "vtt")} --> ${formatTime(item.endTime, "vtt")}\n${text}`;
     }).join("\n\n");
-    downloadFile(content, "transcript.vtt", "text/vtt");
+    const filename = translated ? "translated_transcript.vtt" : "original_transcript.vtt";
+    downloadFile(content, filename, "text/vtt");
   };
 
   const handleReset = () => {
     stopRecording(); // Ensure everything is stopped first
     resetTranscript();
-    setTranscribedSegments([]);
+    setChunks([]);
     setRecordings([]);
     lastFinalTranscriptRef.current = "";
     setSeconds(0);
-    setCurrentInterim("");
+    setCurrentInterimForChunk("");
     toast({
       title: "All data reset.",
       status: "info",
@@ -255,6 +372,9 @@ const DictaphoneUI = () => {
       isClosable: true,
     });
   };
+
+  // The current display text in the transcription box
+  const currentDisplayText = chunks.map(chunk => chunk.originalText).join(" ") + " " + currentInterimForChunk;
 
   return (
     <Center minH="100vh" bg="gray.50" p={4}>
@@ -272,56 +392,66 @@ const DictaphoneUI = () => {
           🎙️ Dictaphone
         </Heading>
         <Text textAlign="center" fontSize="md" color="gray.600">
-          Record your voice, transcribe it in multiple languages, and download the results.
+          Record, transcribe, chunk by {CHUNK_DURATION}s, and translate your audio.
         </Text>
 
-        {/* Language Selector */}
-        <HStack w="full" justifyContent="center" py={2}>
-          <Text fontWeight="medium" color="gray.700">Language:</Text>
-          <Select
-            w="180px"
-            value={language}
-            onChange={(e) => {
-              setLanguage(e.target.value);
-              if (recordingAudio || listening) {
-                // If recording, stop and restart with new language
-                stopRecording();
-                toast({
-                  title: "Language changed.",
-                  description: "Recording stopped. Please start a new recording with the selected language.",
-                  status: "warning",
-                  duration: 4000,
-                  isClosable: true,
-                });
-              } else {
-                toast({
-                  title: `Language set to ${e.target.options[e.target.selectedIndex].text}.`,
-                  status: "info",
-                  duration: 2000,
-                  isClosable: true,
-                });
-              }
-            }}
-            borderColor="gray.300"
-            _focus={{ borderColor: "purple.400", boxShadow: "0 0 0 1px purple.400" }}
-          >
-            <option value="en-US">English (US)</option>
-            <option value="en-GB">English (UK)</option>
-            <option value="gu-IN">Gujarati (India)</option>
-            <option value="hi-IN">Hindi (India)</option>
-            <option value="es-ES">Spanish (Spain)</option>
-            <option value="fr-FR">French (France)</option>
-            <option value="de-DE">German (Germany)</option>
-            {/* Add more languages as needed */}
-          </Select>
-        </HStack>
+        {/* Language Selectors */}
+        <Flex w="full" justifyContent="center" py={2} wrap="wrap" gap={4}>
+          <HStack>
+            <Text fontWeight="medium" color="gray.700">Source:</Text>
+            <Select
+              w="180px"
+              value={sourceLanguage}
+              onChange={(e) => {
+                setSourceLanguage(e.target.value);
+                if (recordingAudio || listening) {
+                  stopRecording();
+                  toast({
+                    title: "Language changed.",
+                    description: "Recording stopped. Please start a new recording with the selected source language.",
+                    status: "warning",
+                    duration: 4000,
+                    isClosable: true,
+                  });
+                }
+              }}
+              borderColor="gray.300"
+              _focus={{ borderColor: "purple.400", boxShadow: "0 0 0 1px purple.400" }}
+            >
+              <option value="en-US">English (US)</option>
+              <option value="en-GB">English (UK)</option>
+              <option value="gu-IN">Gujarati (India)</option>
+              <option value="hi-IN">Hindi (India)</option>
+              <option value="es-ES">Spanish (Spain)</option>
+              <option value="fr-FR">French (France)</option>
+              <option value="de-DE">German (Germany)</option>
+            </Select>
+          </HStack>
+          <HStack>
+            <Text fontWeight="medium" color="gray.700">Target:</Text>
+            <Select
+              w="180px"
+              value={targetLanguage}
+              onChange={(e) => setTargetLanguage(e.target.value.split('-')[0])} // Use base language for target
+              borderColor="gray.300"
+              _focus={{ borderColor: "blue.400", boxShadow: "0 0 0 1px blue.400" }}
+            >
+              <option value="en">English</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="hi">Hindi</option>
+              <option value="gu">Gujarati</option>
+              {/* Add more target languages for translation */}
+            </Select>
+          </HStack>
+        </Flex>
 
         {/* Microphone Button */}
         <Center py={4}>
           <Button
             onClick={recordingAudio ? stopRecording : startRecording}
             borderRadius="full"
-            boxSize="120px" // Make it a large circular button
+            boxSize="120px"
             bg={recordingAudio ? "red.500" : "green.500"}
             color="white"
             boxShadow="lg"
@@ -334,7 +464,7 @@ const DictaphoneUI = () => {
             justifyContent="center"
             aria-label={recordingAudio ? "Stop Recording" : "Start Recording"}
             animation={recordingAudio ? `${pulse} 1.5s infinite ease-in-out` : "none"}
-            isDisabled={!browserSupportsSpeechRecognition}
+            isDisabled={!browserSupportsSpeechRecognition || isTranslating}
           >
             <Icon as={recordingAudio ? FaStop : FaMicrophone} w={10} h={10} mb={1} />
             <Text fontSize="lg" fontWeight="bold">
@@ -366,7 +496,7 @@ const DictaphoneUI = () => {
           border="1px solid"
           borderColor="gray.200"
           borderRadius="xl"
-          align="flex-start" // Align text to the start
+          align="flex-start"
           spacing={1}
           sx={{
             "&::-webkit-scrollbar": {
@@ -381,50 +511,84 @@ const DictaphoneUI = () => {
             },
           }}
         >
-          {transcribedSegments.length > 0 ? (
-            transcribedSegments.map((item, idx) => (
-              <Text key={`segment-${idx}`} fontSize="md" my={0.5} color="gray.800">
-                <Text as="span" fontWeight="medium" color="gray.600">[{formatTime(item.timestamp)}]</Text> {item.text}
-              </Text>
-            ))
-          ) : (
+          {chunks.length === 0 && !currentInterimForChunk && !listening && (
             <Text fontSize="md" color="gray.400">
-              {listening && interimTranscript ? "" : "Your transcription will appear here..."}
+              Transcription will appear here in {CHUNK_DURATION}s chunks...
             </Text>
           )}
-          {currentInterim && (
-            <Text fontSize="md" color="gray.500" fontStyle="italic">
-              {currentInterim}
-            </Text>
+          {chunks.map((chunk) => (
+            <Box key={chunk.id} p={2} bg="white" borderRadius="md" w="full" boxShadow="xs">
+              <HStack justifyContent="space-between">
+                <Text fontSize="sm" fontWeight="medium" color="gray.600">
+                  [{formatTime(chunk.startTime)} - {formatTime(chunk.endTime)}]
+                </Text>
+                {chunk.translatedText && (
+                  <Tag size="sm" colorScheme="blue">Translated</Tag>
+                )}
+              </HStack>
+              <Text fontSize="md" color="gray.800" mt={1}>
+                {chunk.originalText}
+              </Text>
+              {chunk.translatedText && (
+                <Text fontSize="sm" color="blue.700" mt={1} fontStyle="italic">
+                  {chunk.translatedText}
+                </Text>
+              )}
+            </Box>
+          ))}
+          {currentInterimForChunk && (
+            <Box p={2} bg="gray.100" borderRadius="md" w="full" boxShadow="xs">
+              <Text fontSize="sm" fontWeight="medium" color="gray.500">
+                [Interim ({formatTime(seconds)})]
+              </Text>
+              <Text fontSize="md" color="gray.600" fontStyle="italic" mt={1}>
+                {currentInterimForChunk}
+                {listening && <Spinner size="xs" ml={2} />}
+              </Text>
+            </Box>
           )}
         </VStack>
 
-        {/* Download and Reset Buttons */}
-        <HStack w="full" justifyContent="center" spacing={4} pt={2}>
+        {/* Action Buttons */}
+        <Flex w="full" justifyContent="center" spacing={4} pt={2} wrap="wrap" gap={4}>
+          <Button
+            onClick={handleTranslateAll}
+            colorScheme="blue"
+            leftIcon={isTranslating ? <Spinner size="sm" /> : <Icon as={FaLanguage} />}
+            isDisabled={chunks.length === 0 || isTranslating}
+          >
+            {isTranslating ? "Translating..." : "Translate All Chunks"}
+          </Button>
+
           <Menu>
             <MenuButton
               as={Button}
               colorScheme="purple"
               rightIcon={<Icon as={FaDownload} />}
-              isDisabled={transcribedSegments.length === 0}
+              isDisabled={chunks.length === 0 || isTranslating}
             >
-              Download Transcript
+              Download Transcripts
             </MenuButton>
             <MenuList>
-              <MenuItem onClick={downloadTXT}>.txt (Plain Text)</MenuItem>
-              <MenuItem onClick={downloadSRT}>.srt (SubRip Subtitle)</MenuItem>
-              <MenuItem onClick={downloadVTT}>.vtt (WebVTT Subtitle)</MenuItem>
+              <MenuItem onClick={() => downloadTXT(false)}>Original .txt</MenuItem>
+              <MenuItem onClick={() => downloadSRT(false)}>Original .srt</MenuItem>
+              <MenuItem onClick={() => downloadVTT(false)}>Original .vtt</MenuItem>
+              <Divider />
+              <MenuItem onClick={() => downloadTXT(true)} isDisabled={!chunks.some(c => c.translatedText)}>Translated .txt</MenuItem>
+              <MenuItem onClick={() => downloadSRT(true)} isDisabled={!chunks.some(c => c.translatedText)}>Translated .srt</MenuItem>
+              <MenuItem onClick={() => downloadVTT(true)} isDisabled={!chunks.some(c => c.translatedText)}>Translated .vtt</MenuItem>
             </MenuList>
           </Menu>
+
           <Button
             onClick={handleReset}
             colorScheme="gray"
             leftIcon={<Icon as={FaRedo} />}
-            isDisabled={!transcribedSegments.length && !recordings.length && !listening && !recordingAudio}
+            isDisabled={(!chunks.length && !recordings.length && !listening && !recordingAudio) || isTranslating}
           >
             Reset All
           </Button>
-        </HStack>
+        </Flex>
 
         {/* Recordings List */}
         {recordings.length > 0 && (
@@ -434,7 +598,7 @@ const DictaphoneUI = () => {
             </Heading>
             {recordings.map((rec, idx) => (
               <Box
-                key={rec.timestamp} // Use timestamp for unique key
+                key={rec.timestamp}
                 w="full"
                 p={4}
                 bg="gray.50"
